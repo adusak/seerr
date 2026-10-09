@@ -89,6 +89,12 @@ Most OpenID Connect providers follow the same basic setup pattern:
 
 The default scopes (`openid profile email`) are sufficient for most providers. Only adjust scopes or required claims if your provider requires it.
 
+## Upgrading from the preview-OIDC build
+
+If you ran the earlier `preview-OIDC` build, your OpenID Connect providers in `settings.json` and your linked accounts are kept. The database migrations add the missing indexes on the `linked_accounts` table. If the same provider account (`provider` and `sub`) is linked more than once, only the oldest link is kept.
+
+The redirect URI has changed. The earlier build used `https://<your-seerr-url>/login?provider=<slug>&callback=true`. Update the allowed redirect URIs in your identity provider to the URIs listed in [Provider Setup](#provider-setup), or login will fail with a redirect URI error.
+
 ## Provider Guides
 
 ### Keycloak
