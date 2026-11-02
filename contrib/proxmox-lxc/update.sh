@@ -14,6 +14,12 @@
 # build does not change the installation. After a successful update, this
 # script replaces /usr/bin/update with the version from the new code.
 #
+# Node.js is upgraded from the NodeSource repository (as installed by
+# community-scripts) to the newest release of the major version that
+# package.json requires. This also occurs when Seerr is already up to date, so
+# that Node.js security releases are installed. If Node.js changes, the service
+# is restarted.
+#
 # Options:
 #   --force   Rebuild even when the installation is already up to date.
 #
@@ -23,6 +29,7 @@
 #   SEERR_SERVICE  systemd service name (default: seerr)
 #   SEERR_CONF     Environment file of the service (default: /etc/seerr/seerr.conf)
 #   SEERR_UPDATE_BIN  Path of the update command (default: /usr/bin/update)
+#   SEERR_NODE_UPGRADE  Set to 0 to not upgrade Node.js (default: 1)
 
 set -Eeuo pipefail
 
@@ -31,6 +38,9 @@ SEERR_BRANCH="${SEERR_BRANCH:-main}"
 SEERR_SERVICE="${SEERR_SERVICE:-seerr}"
 SEERR_CONF="${SEERR_CONF:-/etc/seerr/seerr.conf}"
 SEERR_UPDATE_BIN="${SEERR_UPDATE_BIN:-/usr/bin/update}"
+SEERR_NODE_UPGRADE="${SEERR_NODE_UPGRADE:-1}"
+NODESOURCE_KEY_URL="https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
+NODESOURCE_KEYRING="/etc/apt/keyrings/nodesource.gpg"
 STAGE_DIR="${SEERR_DIR}.new"
 PREV_DIR="${SEERR_DIR}.prev"
 SELF_PATH="contrib/proxmox-lxc/update.sh"
@@ -49,6 +59,7 @@ done
 
 info() { echo -e "\e[1;34m==>\e[0m $*"; }
 ok() { echo -e "\e[1;32m==>\e[0m $*"; }
+warn() { echo -e "\e[1;33m==> WARNING:\e[0m $*" >&2; }
 die() {
   echo -e "\e[1;31m==> ERROR:\e[0m $*" >&2
   exit 1
@@ -60,6 +71,87 @@ die() {
 conf_value() {
   [[ -f "$SEERR_CONF" ]] || return 0
   sed -n "s/^[[:space:]]*$1=//p" "$SEERR_CONF" | tail -n1 | tr -d "\"'"
+}
+
+node_version() { node -p 'process.versions.node' 2>/dev/null || echo "none"; }
+
+# Succeeds when the installed Node.js satisfies the range "^X.Y.Z"
+node_satisfies() {
+  node -e '
+    const [want, have] = [process.argv[1], process.versions.node].map((v) => v.split(".").map(Number));
+    process.exit(have[0] === want[0] && (have[1] > want[1] || (have[1] === want[1] && have[2] >= (want[2] || 0))) ? 0 : 1);
+  ' "$1" 2>/dev/null
+}
+
+# Upgrades Node.js from the NodeSource repository to the newest release of
+# major version $1. Sets NODE_CHANGED=1 when the installed version changed.
+NODE_CHANGED=0
+NODE_MAJOR_CHANGED=0
+upgrade_node() {
+  local major="$1" before after keyfile
+  local -a files=()
+  [[ "$SEERR_NODE_UPGRADE" == "0" ]] && return 0
+  for f in /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  if ((${#files[@]} == 0)); then
+    warn "Node.js is not installed from the NodeSource repository, so it is not upgraded automatically."
+    return 0
+  fi
+
+  info "Upgrading Node.js to the newest ${major}.x release"
+  before="$(node_version)"
+
+  # NodeSource changed its signing key in 2026-01. With the old key, apt keeps
+  # the old package index and the upgrade does nothing.
+  keyfile="$(mktemp)"
+  if command -v gpg >/dev/null 2>&1 &&
+    curl -fsSL --max-time 30 "$NODESOURCE_KEY_URL" | gpg --dearmor --yes -o "$keyfile" 2>/dev/null; then
+    install -D -m 644 "$keyfile" "$NODESOURCE_KEYRING"
+  else
+    warn "Could not refresh the NodeSource signing key."
+  fi
+  rm -f "$keyfile"
+
+  sed -i -E "s#(deb\.nodesource\.com/node_)[0-9]+\.x#\1${major}.x#" "${files[@]}"
+  if ! { apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -q nodejs; } >/tmp/seerr-update-node.log 2>&1; then
+    die "Node.js upgrade failed. Log: /tmp/seerr-update-node.log. The installed version of Seerr was not changed."
+  fi
+
+  after="$(node_version)"
+  if [[ "$before" != "$after" ]]; then
+    NODE_CHANGED=1
+    [[ "${before%%.*}" != "${after%%.*}" ]] && NODE_MAJOR_CHANGED=1
+    ok "Upgraded Node.js from $before to $after"
+  else
+    ok "Node.js $after is the newest ${major}.x release"
+  fi
+}
+
+# Waits until Seerr responds. Fails if it does not start.
+wait_for_seerr() {
+  local port
+  port="$(conf_value PORT)"
+  port="${port:-5055}"
+  info "Waiting for Seerr on port $port (database migrations can take some time)"
+  for _ in $(seq 1 120); do
+    if curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:${port}/api/v1/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    systemctl is-active --quiet "$SEERR_SERVICE" || break
+    sleep 5
+  done
+  journalctl -u "$SEERR_SERVICE" -n 50 --no-pager || true
+  return 1
+}
+
+# Stops after a failed build. The old build cannot run on a new major version
+# of Node.js, because its native modules were compiled for the old one.
+build_failed() {
+  if [[ $NODE_MAJOR_CHANGED -eq 1 ]]; then
+    die "$1 Node.js was upgraded to a new major version, so the installed Seerr can fail on its next restart. Fix the problem or restore your LXC snapshot."
+  fi
+  die "$1 The installed version was not changed."
 }
 
 # --- Find the target commit -------------------------------------------------
@@ -78,6 +170,13 @@ current_branch="$(git symbolic-ref --quiet --short HEAD || true)"
 
 if [[ $FORCE -eq 0 && "$current" == "$target" && "$current_branch" == "$SEERR_BRANCH" && -f dist/index.js ]]; then
   ok "Seerr is already up to date ($(git log -1 --format='%h %s' HEAD))."
+  upgrade_node "$(node -p 'process.versions.node.split(".")[0]')"
+  if [[ $NODE_CHANGED -eq 1 ]] && systemctl is-active --quiet "$SEERR_SERVICE"; then
+    info "Restarting $SEERR_SERVICE to use Node.js $(node_version)"
+    systemctl restart "$SEERR_SERVICE"
+    wait_for_seerr || die "Seerr did not start after the Node.js upgrade."
+    ok "Restarted $SEERR_SERVICE"
+  fi
   exit 0
 fi
 
@@ -99,14 +198,10 @@ git checkout --quiet -B "$SEERR_BRANCH" "$target"
 git fetch --quiet origin "$SEERR_BRANCH"
 git branch --quiet --set-upstream-to="origin/$SEERR_BRANCH"
 
-info "Checking Node.js version"
 node_range="$(sed -n 's/.*"node": *"\^\{0,1\}\([0-9.]*\)".*/\1/p' package.json | head -n1)"
-# shellcheck disable=SC2016 # JavaScript template string, not shell
-node -e '
-  const [want, have] = [process.argv[1], process.versions.node].map((v) => v.split(".").map(Number));
-  const ok = have[0] === want[0] && (have[1] > want[1] || (have[1] === want[1] && have[2] >= (want[2] || 0)));
-  if (!ok) { console.error(`Node.js ^${process.argv[1]} is necessary, but ${process.versions.node} is installed.`); process.exit(1); }
-' "$node_range" || die "Install a supported Node.js version (for example: apt update && apt install -y nodejs) and try again."
+upgrade_node "${node_range%%.*}"
+node_satisfies "$node_range" ||
+  build_failed "Node.js ^$node_range is necessary, but $(node_version) is installed."
 
 pnpm_version="$(sed -n 's/.*"packageManager": *"pnpm@\([^"]*\)".*/\1/p' package.json)"
 if [[ -n "$pnpm_version" && "$(pnpm -v 2>/dev/null || true)" != "$pnpm_version" ]]; then
@@ -117,11 +212,11 @@ fi
 info "Installing dependencies (Patience)"
 export CYPRESS_INSTALL_BINARY=0 HUSKY=0
 pnpm install --frozen-lockfile --reporter=append-only >/tmp/seerr-update-install.log 2>&1 ||
-  die "Dependency installation failed. Log: /tmp/seerr-update-install.log. The installed version was not changed."
+  build_failed "Dependency installation failed. Log: /tmp/seerr-update-install.log."
 
 info "Building Seerr (Patience)"
 NODE_OPTIONS="--max-old-space-size=3072" pnpm build >/tmp/seerr-update-build.log 2>&1 ||
-  die "Build failed. Log: /tmp/seerr-update-build.log. The installed version was not changed."
+  build_failed "Build failed. Log: /tmp/seerr-update-build.log."
 ok "Build complete"
 
 # --- Swap the installation ----------------------------------------------------
@@ -143,25 +238,8 @@ fi
 info "Starting $SEERR_SERVICE"
 systemctl start "$SEERR_SERVICE"
 
-port="$(conf_value PORT)"
-port="${port:-5055}"
-info "Waiting for Seerr on port $port (database migrations can take some time)"
-started=0
-for _ in $(seq 1 120); do
-  if curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:${port}/api/v1/status" >/dev/null 2>&1; then
-    started=1
-    break
-  fi
-  if ! systemctl is-active --quiet "$SEERR_SERVICE"; then
-    break
-  fi
-  sleep 5
-done
-
-if [[ $started -ne 1 ]]; then
-  journalctl -u "$SEERR_SERVICE" -n 50 --no-pager || true
+wait_for_seerr ||
   die "Seerr did not start. The previous code is in $PREV_DIR, but the database can already be migrated. Restore your LXC snapshot to go back."
-fi
 
 rm -rf "$PREV_DIR"
 
