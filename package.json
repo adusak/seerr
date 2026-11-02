@@ -1,6 +1,6 @@
 {
   "name": "seerr",
-  "version": "3.5.0",
+  "version": "3.5.1",
   "private": true,
   "packageManager": "pnpm@10.24.0",
   "scripts": {
