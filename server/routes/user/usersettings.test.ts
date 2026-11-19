@@ -5,6 +5,7 @@ import JellyfinAPI from '@server/api/jellyfin';
 import { MediaServerType } from '@server/constants/server';
 import { UserType } from '@server/constants/user';
 import { getRepository } from '@server/datasource';
+import { LinkedAccount } from '@server/entity/LinkedAccount';
 import { User } from '@server/entity/User';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
@@ -178,6 +179,64 @@ describe('POST /user/:id/settings/main', () => {
       where: { id: otherAdmin.id },
     });
     assert.strictEqual(user.email, 'new@example.com');
+  });
+});
+
+describe('DELETE /user/:id/settings/linked-accounts/:acctId', () => {
+  async function linkOidcAccount(user: User) {
+    const settings = getSettings();
+    settings.main.oidcLogin = true;
+    settings.oidc.providers = [
+      {
+        slug: 'test',
+        name: 'Test',
+        issuerUrl: 'https://oidc.example.com',
+        clientId: 'seerr',
+        clientSecret: 'secret',
+      },
+    ];
+    await user.setPassword('test1234');
+    await getRepository(User).save(user);
+    return getRepository(LinkedAccount).save(
+      new LinkedAccount({
+        user,
+        provider: 'test',
+        sub: 'admin2-oidc-sub',
+        username: 'admin2',
+      })
+    );
+  }
+
+  it("stops a manager from unlinking an admin's OIDC account", async () => {
+    const { otherAdmin } = await seedManagerAndAdmin();
+    const account = await linkOidcAccount(otherAdmin);
+    const { agent } = await loginAs('demo@seerr.dev', 'test1234');
+
+    const res = await agent.delete(
+      `/user/${otherAdmin.id}/settings/linked-accounts/${account.id}`
+    );
+
+    assert.strictEqual(res.status, 403);
+    assert.ok(
+      await getRepository(LinkedAccount).exists({ where: { id: account.id } })
+    );
+  });
+
+  it("lets the owner unlink an admin's OIDC account", async () => {
+    const { otherAdmin } = await seedManagerAndAdmin();
+    const account = await linkOidcAccount(otherAdmin);
+    const { agent } = await loginAs('admin@seerr.dev', 'test1234');
+
+    const res = await agent.delete(
+      `/user/${otherAdmin.id}/settings/linked-accounts/${account.id}`
+    );
+
+    assert.strictEqual(res.status, 204);
+    assert.ok(
+      !(await getRepository(LinkedAccount).exists({
+        where: { id: account.id },
+      }))
+    );
   });
 });
 
