@@ -214,6 +214,21 @@ export CYPRESS_INSTALL_BINARY=0 HUSKY=0
 pnpm install --frozen-lockfile --reporter=append-only >/tmp/seerr-update-install.log 2>&1 ||
   build_failed "Dependency installation failed. Log: /tmp/seerr-update-install.log."
 
+# A prebuilt native module can need a newer glibc than the container has
+# (the sqlite3 6 binary needs glibc 2.38, Debian 12 has 2.36). Compile sqlite3
+# for this system when its prebuilt binary does not load, and make sure that
+# all native modules load before the installed version is replaced.
+native_error() { node -e "require('$1')" 2>&1 | grep -m1 -E 'Error|not found' || true; }
+if [[ -n "$(native_error sqlite3)" ]]; then
+  info "Compiling sqlite3 for this system, because its prebuilt binary does not load (Patience)"
+  npm_config_build_from_source=true pnpm rebuild sqlite3 >/tmp/seerr-update-sqlite3.log 2>&1 ||
+    build_failed "Compiling sqlite3 failed. Log: /tmp/seerr-update-sqlite3.log."
+fi
+for module in sqlite3 bcrypt sharp; do
+  error="$(native_error "$module")"
+  [[ -z "$error" ]] || build_failed "The native module $module does not load: $error"
+done
+
 info "Building Seerr (Patience)"
 NODE_OPTIONS="--max-old-space-size=3072" pnpm build >/tmp/seerr-update-build.log 2>&1 ||
   build_failed "Build failed. Log: /tmp/seerr-update-build.log."
